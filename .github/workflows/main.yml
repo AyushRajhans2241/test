@@ -1,34 +1,25 @@
-name: DIVA Application VAPT Scan
-on: 
-  workflow_dispatch:
+- name: Start MobSF
+  run: |
+    docker run -d --name mobsf -p 8000:8000 \
+      -v ${{ github.workspace }}:/home/mobsf/app \
+      opensecurity/mobsf:latest
+    sleep 30  # wait for server startup
 
-jobs:
-  mobsf_scan:
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    steps:
-      - name: Checkout Code Repo
-        uses: actions/checkout@v4
-
-      - name: Execute MobSF Container Scan
-        run: |
-          # 1. Allow the local workspace directory to be readable by the container user
-          chmod -R 777 ${{ github.workspace }}
-          
-          # 2. Run the correct official Docker image name
-          docker run --rm \
-            -v ${{ github.workspace }}:/home/mobsf/app \
-            opensecurity/mobile-security-framework-mobsf:latest \
-            python3 /home/mobsf/Mobile-Security-Framework-MobSF/mobsf/cli.py \
-            --apk /home/mobsf/app/DivaApplication.apk \
-            --output /home/mobsf/app/mobsf-report
-
-      - name: Archive Scan Reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: DIVA-Security-Report
-          path: |
-            mobsf-report.json
-            mobsf-report.pdf
+- name: Run scan via API
+  run: |
+    # Upload
+    UPLOAD=$(curl -s -F "file=@DivaApplication.apk" \
+      -F "fileName=DivaApplication.apk" \
+      http://localhost:8000/api/v1/upload \
+      -H "Authorization: $(docker exec mobsf cat /home/mobsf/Mobile-Security-Framework-MobSF/mobsf/utils/settings.py | grep REST_API_KEY | cut -d'"' -f2)")
+    HASH=$(echo $UPLOAD | jq -r '.hash')
+    # Scan
+    curl -s -X POST http://localhost:8000/api/v1/scan \
+      -d "scan_type=apk&file_name=DivaApplication.apk&hash=$HASH" \
+      -H "Authorization: $API_KEY"
+    # Export PDF
+    curl -s -X POST http://localhost:8000/api/v1/download_pdf \
+      -d "hash=$HASH" -H "Authorization: $API_KEY" -o mobsf-report.pdf
+    # Export JSON
+    curl -s -X POST http://localhost:8000/api/v1/report_json \
+      -d "hash=$HASH" -H "Authorization: $API_KEY" -o mobsf-report.json

@@ -1,82 +1,120 @@
-name: DIVA Application VAPT Scan
+name: MobSF APK Security Scan
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
-  mobsf_scan:
+  mobsf-scan:
     runs-on: ubuntu-latest
+
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      APK_FILE: DivaApplication.apk
+      MOBSF_URL: http://localhost:8000
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Login to DockerHub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Start MobSF server
+      - name: Verify APK Exists
         run: |
-          docker run -d --name mobsf -p 8000:8000 \
-            -e MOBSF_API_KEY=${{ secrets.MOBSF_API_KEY }} \
-            opensecurity/mobsf:latest
-          echo "Waiting for MobSF to initialize..."
-          sleep 45
+          ls -lah
+          test -f "${APK_FILE}"
 
-      - name: Verify MobSF is running
+      - name: Pull MobSF Image
         run: |
-          curl -s --retry 5 --retry-delay 10 \
-            http://localhost:8000/ | head -c 100
+          docker pull opensecurity/mobile-security-framework-mobsf:latest
 
-      - name: Upload APK and get hash
+      - name: Start MobSF Container
         run: |
-          HASH=$(curl -s \
-            -F "file=@DivaApplication.apk" \
-            -H "Authorization: ${{ secrets.MOBSF_API_KEY }}" \
-            http://localhost:8000/api/v1/upload | jq -r '.hash')
+          docker run -d \
+            --name mobsf \
+            -p 8000:8000 \
+            opensecurity/mobile-security-framework-mobsf:latest
 
-          echo "APK hash: $HASH"
+      - name: Wait for MobSF Startup
+        run: |
+          echo "Waiting for MobSF to start..."
+          timeout 300 bash -c '
+            until curl -s http://localhost:8000 > /dev/null; do
+              echo "MobSF not ready..."
+              sleep 10
+            done
+          '
+          echo "MobSF is ready"
 
-          if [ -z "$HASH" ] || [ "$HASH" == "null" ]; then
-            echo "Upload failed or hash is null"
+      - name: Display MobSF Logs
+        run: |
+          docker logs mobsf --tail 100
+
+      - name: Obtain API Key
+        run: |
+          API_KEY=$(docker exec mobsf sh -c "grep -m1 API_KEY /home/mobsf/.MobSF/config.py | cut -d\"'\" -f2")
+
+          if [ -z "$API_KEY" ]; then
+            echo "Failed to retrieve API key"
             exit 1
           fi
 
-          echo "MOBSF_HASH=$HASH" >> $GITHUB_ENV
+          echo "MOBSF_API_KEY=$API_KEY" >> $GITHUB_ENV
 
-      - name: Run scan
+      - name: Upload APK
         run: |
-          curl -s -X POST http://localhost:8000/api/v1/scan \
-            -d "scan_type=apk&file_name=DivaApplication.apk&hash=${{ env.MOBSF_HASH }}" \
-            -H "Authorization: ${{ secrets.MOBSF_API_KEY }}"
+          RESPONSE=$(curl -s \
+            -H "Authorization: $MOBSF_API_KEY" \
+            -F "file=@${APK_FILE}" \
+            "${MOBSF_URL}/api/v1/upload")
 
-      - name: Export PDF report
+          echo "$RESPONSE"
+
+          HASH=$(echo "$RESPONSE" | jq -r '.hash')
+          FILE_NAME=$(echo "$RESPONSE" | jq -r '.file_name')
+
+          echo "HASH=$HASH" >> $GITHUB_ENV
+          echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
+
+      - name: Run Static Analysis
         run: |
-          curl -s -X POST http://localhost:8000/api/v1/download_pdf \
-            -d "hash=${{ env.MOBSF_HASH }}" \
-            -H "Authorization: ${{ secrets.MOBSF_API_KEY }}" \
-            -o ${{ github.workspace }}/mobsf-report.pdf
+          curl -s \
+            -H "Authorization: $MOBSF_API_KEY" \
+            -F "scan_type=apk" \
+            -F "file_name=$FILE_NAME" \
+            -F "hash=$HASH" \
+            "${MOBSF_URL}/api/v1/scan"
 
-      - name: Export JSON report
+      - name: Download JSON Report
         run: |
-          curl -s -X POST http://localhost:8000/api/v1/report_json \
-            -d "hash=${{ env.MOBSF_HASH }}" \
-            -H "Authorization: ${{ secrets.MOBSF_API_KEY }}" \
-            -o ${{ github.workspace }}/mobsf-report.json
+          curl -s \
+            -H "Authorization: $MOBSF_API_KEY" \
+            -F "hash=$HASH" \
+            "${MOBSF_URL}/api/v1/report_json" \
+            -o mobsf-report.json
 
-      - name: Verify report files exist
+      - name: Download PDF Report
         run: |
-          ls -lh ${{ github.workspace }}/mobsf-report.*
+          curl -s \
+            -H "Authorization: $MOBSF_API_KEY" \
+            -F "hash=$HASH" \
+            "${MOBSF_URL}/api/v1/download_pdf" \
+            -o mobsf-report.pdf
 
-      - name: Archive scan reports
-        if: always()
+      - name: Verify Reports
+        run: |
+          ls -lah mobsf-report.*
+
+      - name: Upload Scan Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: DIVA-Security-Report
+          name: mobsf-security-report
           path: |
-            ${{ github.workspace }}/mobsf-report.json
-            ${{ github.workspace }}/mobsf-report.pdf
+            mobsf-report.json
+            mobsf-report.pdf
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop mobsf || true
+          docker rm mobsf || true

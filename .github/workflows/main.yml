@@ -13,6 +13,7 @@ jobs:
     env:
       APK_FILE: DivaApplication.apk
       MOBSF_URL: http://localhost:8000
+      MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
 
     steps:
       - name: Checkout Repository
@@ -23,7 +24,7 @@ jobs:
           ls -lah
           test -f "$APK_FILE"
 
-      - name: Pull MobSF
+      - name: Pull MobSF Image
         run: |
           docker pull opensecurity/mobile-security-framework-mobsf:latest
 
@@ -34,7 +35,7 @@ jobs:
             -p 8000:8000 \
             opensecurity/mobile-security-framework-mobsf:latest
 
-      - name: Wait for MobSF
+      - name: Wait for MobSF Startup
         run: |
           timeout 600 bash -c '
             until curl -s http://localhost:8000 > /dev/null; do
@@ -42,29 +43,18 @@ jobs:
               sleep 10
             done
           '
-
-      - name: Show MobSF Logs
-        run: |
-          docker logs mobsf --tail 200
+          sleep 60
 
       - name: Install jq
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
 
-      - name: Get API Key
+      - name: Verify MobSF API Access
         run: |
-          API_KEY=$(curl -s http://localhost:8000/api_docs | grep -oP '(?<=API Key: )[A-Za-z0-9]+')
-
-          if [ -z "$API_KEY" ]; then
-            echo "Failed to extract API key"
-            echo "==== API_DOCS ===="
-            curl -s http://localhost:8000/api_docs
-            exit 1
-          fi
-
-          echo "API key length: ${#API_KEY}"
-          echo "MOBSF_API_KEY=$API_KEY" >> $GITHUB_ENV
+          curl -v \
+            -H "Authorization: $MOBSF_API_KEY" \
+            "$MOBSF_URL/api/v1/scans" || true
 
       - name: Upload APK
         run: |
@@ -78,22 +68,25 @@ jobs:
           HASH=$(echo "$RESPONSE" | jq -r '.hash')
           FILE_NAME=$(echo "$RESPONSE" | jq -r '.file_name')
 
-          if [ "$HASH" = "null" ] || [ -z "$HASH" ]; then
-            echo "Upload failed"
+          if [ -z "$HASH" ] || [ "$HASH" = "null" ]; then
+            echo "APK upload failed"
             exit 1
           fi
 
           echo "HASH=$HASH" >> $GITHUB_ENV
           echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
 
-      - name: Run Scan
+      - name: Run MobSF Scan
         run: |
-          curl -v \
+          curl -s \
             -H "Authorization: $MOBSF_API_KEY" \
             -F "scan_type=apk" \
             -F "file_name=$FILE_NAME" \
             -F "hash=$HASH" \
-            "$MOBSF_URL/api/v1/scan"
+            "$MOBSF_URL/api/v1/scan" \
+            -o scan-result.json
+
+          cat scan-result.json
 
       - name: Download JSON Report
         run: |
@@ -111,20 +104,24 @@ jobs:
             "$MOBSF_URL/api/v1/download_pdf" \
             -o mobsf-report.pdf
 
-      - name: Verify Reports
+      - name: Validate Reports
         run: |
           ls -lah
-          file mobsf-report.json || true
-          file mobsf-report.pdf || true
-          cat mobsf-report.json | head -50 || true
+          echo "=== JSON REPORT ==="
+          head -50 mobsf-report.json || true
 
-      - name: Upload Artifacts
+      - name: Upload Reports
         uses: actions/upload-artifact@v4
         with:
           name: mobsf-security-report
           path: |
             mobsf-report.json
             mobsf-report.pdf
+
+      - name: Show MobSF Logs
+        if: always()
+        run: |
+          docker logs mobsf --tail 200
 
       - name: Cleanup
         if: always()

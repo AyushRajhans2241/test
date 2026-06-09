@@ -1,4 +1,4 @@
-name: Mobile VAPT Pipeline
+name: DIVA Application VAPT Scan
 on: 
   workflow_dispatch:
 
@@ -8,18 +8,17 @@ jobs:
     steps:
       - name: Checkout Code Repo
         uses: actions/checkout@v4
-      - name: Download Target APK File
-        env:
-          APK_URL: ${{ secrets.CLIENT_APK_URL }}
-        run: curl -L -o target.apk "$APK_URL"
+
       - name: Execute MobSF Static Analysis
         uses: fundacaocerti/mobsf-action@v1.7.2
         with:
+          # Make sure this matches your file name exactly
           args: --apk DivaApplication.apk --output mobsf-report
+
       - name: Archive Scan Reports
         uses: actions/upload-artifact@v4
         with:
-          name: MobSF-Reports
+          name: DIVA-Security-Report
           path: |
             mobsf-report.json
             mobsf-report.pdf

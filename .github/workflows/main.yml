@@ -6,19 +6,26 @@ jobs:
   mobsf_scan:
     runs-on: ubuntu-latest
     env:
-      # Clear the GitHub Node.js warning explicitly
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout Code Repo
         uses: actions/checkout@v4
 
       - name: Execute MobSF Container Scan
-        # Runs the official container directly as root to bypass passwd user restrictions
         run: |
-          docker run --user root -v ${{ github.workspace }}:/home/mobsf/app opensecurity/mobsf:latest /usr/bin/python3 /home/mobsf/Mobile-Security-Framework-MobSF/mobsf/cli.py --apk /home/mobsf/app/DivaApplication.apk --output /home/mobsf/app/mobsf-report
+          # 1. Allow the local workspace directory to be readable by the container user
+          chmod -R 777 ${{ github.workspace }}
+          
+          # 2. Run the correct official Docker image name
+          docker run --rm \
+            -v ${{ github.workspace }}:/home/mobsf/app \
+            opensecurity/mobile-security-framework-mobsf:latest \
+            python3 /home/mobsf/Mobile-Security-Framework-MobSF/mobsf/cli.py \
+            --apk /home/mobsf/app/DivaApplication.apk \
+            --output /home/mobsf/app/mobsf-report
 
       - name: Archive Scan Reports
-        if: always() # Ensures reports upload even if vulnerabilities are flagged
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: DIVA-Security-Report

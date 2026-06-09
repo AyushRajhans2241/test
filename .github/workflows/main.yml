@@ -1,13 +1,13 @@
-name: MobSF APK Scan
+name: MobSF APK Security Scan
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
-  mobsf:
+  mobsf-scan:
     runs-on: ubuntu-latest
 
     env:
@@ -15,7 +15,22 @@ jobs:
       MOBSF_URL: http://localhost:8000
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verify APK Exists
+        run: |
+          ls -lah
+          test -f "$APK_FILE"
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Pull MobSF Image
+        run: |
+          docker pull opensecurity/mobile-security-framework-mobsf:latest
 
       - name: Start MobSF
         run: |
@@ -32,71 +47,30 @@ jobs:
               sleep 10
             done
           '
+
+          # Give MobSF additional startup time
           sleep 60
 
       - name: Discover MobSF API Key
         run: |
           set +e
 
-          API_KEY=""
-
-          echo "Method 1: Container logs"
           API_KEY=$(docker logs mobsf 2>&1 | grep -oE '[A-Fa-f0-9]{32,64}' | head -1)
 
           if [ -z "$API_KEY" ]; then
-            echo "Method 2: Common config files"
-
-            API_KEY=$(docker exec mobsf sh -c '
-              for f in \
-                /home/mobsf/.MobSF/config.py \
-                /root/.MobSF/config.py \
-                /MobSF/.MobSF/config.py
-              do
-                [ -f "$f" ] && grep -i API "$f"
-              done
-            ' 2>/dev/null | grep -oE '[A-Fa-f0-9]{32,64}' | head -1)
-          fi
-
-          if [ -z "$API_KEY" ]; then
-            echo "Method 3: API Docs"
-
-            PAGE=$(curl -s http://localhost:8000/api_docs)
-
-            API_KEY=$(echo "$PAGE" | grep -oE '[A-Fa-f0-9]{32,64}' | head -1)
-          fi
-
-          if [ -z "$API_KEY" ]; then
-            echo "Unable to locate API key"
-
-            echo "===== CONTAINER LOGS ====="
+            echo "Unable to discover API key"
             docker logs mobsf --tail 200
-
-            echo "===== API_DOCS ====="
-            curl -s http://localhost:8000/api_docs | head -200
-
             exit 1
           fi
 
-          echo "Found candidate key"
+          echo "API key discovered"
           echo "MOBSF_API_KEY=$API_KEY" >> $GITHUB_ENV
 
-      - name: Verify API Key
+      - name: Verify API Access
         run: |
-          echo "Testing discovered key..."
-
-          STATUS=$(curl -s \
-            -o /tmp/out.txt \
-            -w "%{http_code}" \
+          curl -s \
             -H "Authorization: $MOBSF_API_KEY" \
-            "$MOBSF_URL/api/v1/scans")
-
-          echo "HTTP Status: $STATUS"
-          cat /tmp/out.txt
-
-          if [ "$STATUS" = "401" ]; then
-            echo "Discovered key is invalid"
-            exit 1
-          fi
+            "$MOBSF_URL/api/v1/scans"
 
       - name: Upload APK
         run: |
@@ -106,3 +80,74 @@ jobs:
             "$MOBSF_URL/api/v1/upload")
 
           echo "$RESPONSE"
+
+          HASH=$(echo "$RESPONSE" | jq -r '.hash')
+          FILE_NAME=$(echo "$RESPONSE" | jq -r '.file_name')
+
+          if [ -z "$HASH" ] || [ "$HASH" = "null" ]; then
+            echo "Upload failed"
+            exit 1
+          fi
+
+          echo "HASH=$HASH" >> $GITHUB_ENV
+          echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
+
+      - name: Run Static Analysis
+        run: |
+          curl -s \
+            -H "Authorization: $MOBSF_API_KEY" \
+            -F "scan_type=apk" \
+            -F "file_name=$FILE_NAME" \
+            -F "hash=$HASH" \
+            "$MOBSF_URL/api/v1/scan" \
+            -o scan-result.json
+
+          cat scan-result.json
+
+      - name: Wait for Analysis Completion
+        run: |
+          sleep 60
+
+      - name: Download JSON Report
+        run: |
+          curl -s \
+            -H "Authorization: $MOBSF_API_KEY" \
+            -F "hash=$HASH" \
+            "$MOBSF_URL/api/v1/report_json" \
+            -o mobsf-report.json
+
+          test -f mobsf-report.json
+
+      - name: Download PDF Report
+        run: |
+          curl -s \
+            -H "Authorization: $MOBSF_API_KEY" \
+            -F "hash=$HASH" \
+            "$MOBSF_URL/api/v1/download_pdf" \
+            -o mobsf-report.pdf
+
+      - name: Verify Reports
+        run: |
+          ls -lah
+          echo "=== JSON REPORT PREVIEW ==="
+          head -20 mobsf-report.json || true
+
+      - name: Upload Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobsf-security-report
+          path: |
+            mobsf-report.json
+            mobsf-report.pdf
+          retention-days: 30
+
+      - name: Show MobSF Logs
+        if: always()
+        run: |
+          docker logs mobsf --tail 200
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop mobsf || true
+          docker rm mobsf || true

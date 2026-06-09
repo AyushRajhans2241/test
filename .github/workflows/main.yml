@@ -1,36 +1,54 @@
 name: DIVA Application VAPT Scan
 on:
   workflow_dispatch:
+
 jobs:
   mobsf_scan:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      API_KEY: mobsfapikey123
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start MobSF
+      - name: Start MobSF server
         run: |
           docker run -d --name mobsf -p 8000:8000 \
-            -e MOBSF_API_KEY=supersecretkey123 \
-            opensecurity/mobsf:v4.1.1
-          sleep 40
+            -e MOBSF_API_KEY=${{ env.API_KEY }} \
+            opensecurity/mobsf:latest
+          echo "Waiting for MobSF to start..."
+          sleep 45
+
+      - name: Verify MobSF is up
+        run: curl -s http://localhost:8000/ | head -c 200
 
       - name: Scan APK
-        env:
-          API_KEY: supersecretkey123
         run: |
-          HASH=$(curl -s -F "file=@DivaApplication.apk" \
-            http://localhost:8000/api/v1/upload \
-            -H "Authorization: $API_KEY" | jq -r '.hash')
+          HASH=$(curl -s \
+            -F "file=@DivaApplication.apk" \
+            -H "Authorization: ${{ env.API_KEY }}" \
+            http://localhost:8000/api/v1/upload | jq -r '.hash')
+
+          echo "Scan hash: $HASH"
+
           curl -s -X POST http://localhost:8000/api/v1/scan \
             -d "scan_type=apk&file_name=DivaApplication.apk&hash=$HASH" \
-            -H "Authorization: $API_KEY"
-          curl -s -X POST http://localhost:8000/api/v1/download_pdf \
-            -d "hash=$HASH" -H "Authorization: $API_KEY" -o mobsf-report.pdf
-          curl -s -X POST http://localhost:8000/api/v1/report_json \
-            -d "hash=$HASH" -H "Authorization: $API_KEY" -o mobsf-report.json
+            -H "Authorization: ${{ env.API_KEY }}"
 
-      - uses: actions/upload-artifact@v4
+          curl -s -X POST http://localhost:8000/api/v1/download_pdf \
+            -d "hash=$HASH" \
+            -H "Authorization: ${{ env.API_KEY }}" \
+            -o mobsf-report.pdf
+
+          curl -s -X POST http://localhost:8000/api/v1/report_json \
+            -d "hash=$HASH" \
+            -H "Authorization: ${{ env.API_KEY }}" \
+            -o mobsf-report.json
+
+      - name: Archive Reports
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: DIVA-Security-Report
           path: |

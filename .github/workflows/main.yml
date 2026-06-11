@@ -162,38 +162,82 @@ jobs:
       - name: Pull MobSF Docker image
         run: docker pull opensecurity/mobile-security-framework-mobsf:latest
 
-      # FIX 2: Generate the API key HERE, before the container starts, so we
-      # own it outright and never need to scrape it from logs.  Writing it to
-      # GITHUB_ENV at this step makes it available to every subsequent step
-      # in the job without any log-polling loop.
-      - name: Generate MobSF API key
-        run: |
-          MOBSF_API_KEY=$(openssl rand -hex 32)
-          echo "MOBSF_API_KEY=$MOBSF_API_KEY" >> "$GITHUB_ENV"
-          echo "API key generated (length: ${#MOBSF_API_KEY})"
-
       - name: Start MobSF
         run: |
           docker run -d \
             --name mobsf \
             -p 8000:8000 \
-            -e MOBSF_REST_OPENAPIKEY="$MOBSF_API_KEY" \
             opensecurity/mobile-security-framework-mobsf:latest
 
-      # ── Wait until the API is genuinely ready ────────────────────────────
-      # Poll /api/v1/scans with the key we already know — no log scraping.
-      - name: Wait for MobSF API readiness
+      # ── Wait for MobSF and extract its self-generated API key ────────────
+      #
+      # WHY log scraping (not env injection):
+      # MobSF v4.5.0 ignores MOBSF_REST_OPENAPIKEY entirely — it generates
+      # its own key during the Django migration phase and prints it twice:
+      #
+      #   REST API Key: 025b095e55d8f197...
+      #
+      # The key only appears AFTER all Django migrations complete, which takes
+      # 60–90s on a cold GitHub Actions runner. The previous implementation
+      # polled the API endpoint before the key was printed, so it was sending
+      # the right request with an empty/wrong key and getting 401 forever.
+      #
+      # CORRECT sequence:
+      #   1. Wait for the literal string "REST API Key:" to appear in logs
+      #      (guarantees migrations are done and the key is valid)
+      #   2. Extract the key from that log line specifically
+      #   3. Only then start polling the API endpoint with the real key
+      - name: Extract MobSF API key and wait for readiness
         run: |
-          echo "Polling MobSF API…"
-          ATTEMPTS=0
-          MAX_ATTEMPTS=60          # 60 × 10 s = 10 min max
+          echo "Waiting for MobSF to complete initialization and print API key…"
 
-          until curl -sf -H "Authorization: $MOBSF_API_KEY" "$MOBSF_URL/api/v1/scans" >/dev/null; do
-            echo "  MobSF not ready yet… (attempt $((ATTEMPTS+1)))"
-            sleep 10
+          MAX_KEY_WAIT=180    # 3 min — migrations always finish within this
+          ELAPSED=0
+
+          # Phase 1: block until "REST API Key:" appears in logs.
+          # This line is only printed after ALL Django migrations succeed,
+          # making it the most reliable readiness signal available.
+          until docker logs mobsf 2>&1 | grep -q "REST API Key:"; do
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+            echo "  Waiting for Django migrations… (${ELAPSED}s)"
+            if [ $ELAPSED -ge $MAX_KEY_WAIT ]; then
+              echo "::error::MobSF did not print API key within ${MAX_KEY_WAIT}s"
+              docker logs mobsf --tail 80
+              exit 1
+            fi
+          done
+
+          # Phase 2: extract the key from the specific log line.
+          # grep the exact label, then cut the value after ": "
+          # The key is a 64-char hex string on MobSF v4.x
+          MOBSF_API_KEY=$(docker logs mobsf 2>&1 \
+            | grep "REST API Key:" \
+            | head -1 \
+            | sed 's/.*REST API Key: //' \
+            | tr -d '[:space:]')
+
+          if [ -z "$MOBSF_API_KEY" ]; then
+            echo "::error::Found 'REST API Key:' line but failed to extract value"
+            docker logs mobsf --tail 80
+            exit 1
+          fi
+
+          echo "API key extracted (length: ${#MOBSF_API_KEY}) ✓"
+          echo "MOBSF_API_KEY=$MOBSF_API_KEY" >> "$GITHUB_ENV"
+
+          # Phase 3: now confirm the HTTP server actually accepts requests.
+          # By this point gunicorn is already running (it starts before
+          # migrations finish), so this loop typically succeeds immediately.
+          MAX_ATTEMPTS=30
+          ATTEMPTS=0
+          until curl -sf -H "Authorization: $MOBSF_API_KEY" \
+              "$MOBSF_URL/api/v1/scans" >/dev/null; do
+            echo "  HTTP not ready yet… (attempt $((ATTEMPTS+1)))"
+            sleep 5
             ATTEMPTS=$((ATTEMPTS + 1))
             if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
-              echo "::error::MobSF API did not become ready in time"
+              echo "::error::MobSF HTTP API did not become ready after key was available"
               docker logs mobsf --tail 50
               exit 1
             fi

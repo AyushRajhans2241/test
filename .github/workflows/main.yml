@@ -17,16 +17,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Find APK
+      - name: Find Latest APK
         run: |
-          APK_FILE=$(find . -type f -name "*.apk" | head -1)
+          APK_FILE=$(find . -type f -name "*.apk" -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
 
           if [ -z "$APK_FILE" ]; then
             echo "No APK found in repository"
             exit 1
           fi
 
-          echo "Found APK: $APK_FILE"
+          echo "Latest APK found: $APK_FILE"
           echo "APK_FILE=$APK_FILE" >> $GITHUB_ENV
 
       - name: Install jq
@@ -66,7 +66,6 @@ jobs:
             exit 1
           fi
 
-          echo "API key discovered"
           echo "MOBSF_API_KEY=$API_KEY" >> $GITHUB_ENV
 
       - name: Verify API Access
@@ -77,6 +76,8 @@ jobs:
 
       - name: Upload APK
         run: |
+          echo "Uploading $APK_FILE"
+
           RESPONSE=$(curl -s \
             -H "Authorization: $MOBSF_API_KEY" \
             -F "file=@$APK_FILE" \
@@ -105,7 +106,6 @@ jobs:
             "$MOBSF_URL/api/v1/scan" \
             -o scan-result.json
 
-          echo "===== SCAN RESULT ====="
           cat scan-result.json
 
       - name: Wait for Analysis Completion
@@ -120,8 +120,6 @@ jobs:
             "$MOBSF_URL/api/v1/report_json" \
             -o mobsf-report.json
 
-          test -f mobsf-report.json
-
       - name: Download PDF Report
         run: |
           curl -s \
@@ -133,8 +131,6 @@ jobs:
       - name: Verify Reports
         run: |
           ls -lah
-
-          echo "===== JSON REPORT PREVIEW ====="
           head -20 mobsf-report.json || true
 
       - name: Upload Reports

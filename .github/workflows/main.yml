@@ -46,10 +46,6 @@ jobs:
           fetch-depth: 0          # Need history to diff against previous commit
 
       # ── Decide which APKs to scan ──────────────────────────────────────────
-      # Priority order:
-      #   1. workflow_dispatch with explicit apk_path  →  scan only that file
-      #   2. push event                                →  scan only APKs in this commit's diff
-      #   3. workflow_dispatch without apk_path        →  scan every APK in the repo
       - name: Build APK matrix
         id: build-matrix
         run: |
@@ -72,7 +68,6 @@ jobs:
             BEFORE="${{ github.event.before }}"
             AFTER="${{ github.event.after }}"
 
-            # First push to branch: before is all-zeros
             if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
               echo "Initial push — scanning all APKs in repository"
               while IFS= read -r -d '' f; do
@@ -81,7 +76,6 @@ jobs:
             else
               echo "Scanning APKs changed between $BEFORE..$AFTER"
               while IFS= read -r f; do
-                # Accept only files that actually exist now (not deletions)
                 if [[ "$f" == *.apk ]] && [ -f "$f" ]; then
                   APK_LIST+=("./$f")
                 fi
@@ -108,13 +102,12 @@ jobs:
           printf '  %s\n' "${APK_LIST[@]}"
 
           # ── Build JSON matrix ─────────────────────────────────────────────
-          # e.g. {"apk":["./app/release/foo.apk","./bar.apk"]}
           JSON_ARRAY=$(printf '%s\n' "${APK_LIST[@]}" | jq -R . | jq -sc '{apk:.}')
           echo "matrix=$JSON_ARRAY"           >> "$GITHUB_OUTPUT"
           echo "count=${#APK_LIST[@]}"        >> "$GITHUB_OUTPUT"
 
   # ─────────────────────────────────────────────
-  #  JOB 2 — Scan each APK (matrix)
+  #  JOB 2 — Scan each APK (matrix with Fixes applied)
   # ─────────────────────────────────────────────
   mobsf-scan:
     name: "Scan › ${{ matrix.apk }}"
@@ -127,14 +120,15 @@ jobs:
       matrix: ${{ fromJson(needs.detect-apks.outputs.apk_matrix) }}
 
     steps:
-      # ── Derive a safe artifact name from the APK path ────────────────────
-      # e.g. "./app/release/MyApp-v1.2.apk" → "MyApp-v1.2"
+      # ── Derive a safe artifact name and API Secret ───────────────────────
       - name: Set APK metadata
         id: meta
         run: |
+          SHARED_KEY=$(openssl rand -hex 32)
+          echo "mobsf_secret_key=$SHARED_KEY" >> "$GITHUB_ENV"
+
           APK_PATH="${{ matrix.apk }}"
           APK_BASENAME=$(basename "$APK_PATH" .apk)
-          # Sanitise for artifact names (no slashes, spaces, special chars)
           SAFE_NAME=$(echo "$APK_BASENAME" | tr -cs '[:alnum:]._-' '_')
           echo "apk_path=$APK_PATH"     >> "$GITHUB_OUTPUT"
           echo "apk_basename=$APK_BASENAME" >> "$GITHUB_OUTPUT"
@@ -153,59 +147,34 @@ jobs:
           fi
           echo "APK size: $(du -sh "$APK" | cut -f1)"
 
+      # FIX: Installed 'bc' package manually so the floating point score checks pass
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y jq curl bc
 
-      # ── MobSF container ──────────────────────────────────────────────────
       - name: Pull MobSF Docker image
         run: docker pull opensecurity/mobile-security-framework-mobsf:latest
 
+      # FIX: Directly injecting the securely generated token into the container
       - name: Start MobSF
         run: |
           docker run -d \
             --name mobsf \
             -p 8000:8000 \
-            -e MOBSF_REST_OPENAPIKEY="$( openssl rand -hex 32 )" \
+            -e MOBSF_REST_OPENAPIKEY="${{ env.mobsf_secret_key }}" \
             opensecurity/mobile-security-framework-mobsf:latest
 
-      # ── Wait until the API is genuinely ready ────────────────────────────
-      # Poll /api/v1/scans (the real API endpoint) rather than just the root.
+      # FIX: Bypassed unreliable log scraping; tracking via deterministic environment key
       - name: Wait for MobSF API readiness
         run: |
-          echo "Polling MobSF API…"
+          echo "Polling MobSF API using pre-shared key..."
           ATTEMPTS=0
-          MAX_ATTEMPTS=60          # 60 × 10 s = 10 min max
-
-          # First extract the API key while we wait
-          until docker logs mobsf 2>&1 | grep -qE '[A-Fa-f0-9]{32,}'; do
-            sleep 5
-            ATTEMPTS=$((ATTEMPTS + 1))
-            if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
-              echo "::error::Timed out waiting for MobSF API key in logs"
-              docker logs mobsf --tail 50
-              exit 1
-            fi
-          done
-
-          # Extract the API key (first long hex string — MobSF prints it prominently)
-          API_KEY=$(docker logs mobsf 2>&1 \
-            | grep -oE '[A-Fa-f0-9]{32,64}' \
-            | grep -v '^0\+$' \
-            | head -1)
-
-          if [ -z "$API_KEY" ]; then
-            echo "::error::Could not extract MobSF API key"
-            docker logs mobsf
-            exit 1
-          fi
-
-          echo "API key discovered (length: ${#API_KEY})"
+          MAX_ATTEMPTS=60 
+          API_KEY="${{ env.mobsf_secret_key }}"
+          
           echo "MOBSF_API_KEY=$API_KEY" >> "$GITHUB_ENV"
 
-          # Now wait until the API actually responds
-          ATTEMPTS=0
           until curl -sf -H "Authorization: $API_KEY" "$MOBSF_URL/api/v1/scans" >/dev/null; do
             echo "  MobSF not ready yet… (attempt $((ATTEMPTS+1)))"
             sleep 10
@@ -218,19 +187,14 @@ jobs:
           done
           echo "MobSF API is ready ✓"
 
-      # ── Upload ────────────────────────────────────────────────────────────
       - name: Upload APK to MobSF
         id: upload
         run: |
           APK="${{ steps.meta.outputs.apk_path }}"
-          echo "Uploading: $APK"
-
           RESPONSE=$(curl -sf \
             -H "Authorization: $MOBSF_API_KEY" \
             -F "file=@${APK}" \
             "$MOBSF_URL/api/v1/upload")
-
-          echo "Upload response: $RESPONSE"
 
           HASH=$(echo "$RESPONSE"     | jq -r '.hash      // empty')
           FILE_NAME=$(echo "$RESPONSE" | jq -r '.file_name // empty')
@@ -238,19 +202,15 @@ jobs:
 
           if [ -z "$HASH" ]; then
             echo "::error::Upload failed — no hash returned"
-            echo "$RESPONSE"
             exit 1
           fi
 
           echo "hash=$HASH"           >> "$GITHUB_OUTPUT"
           echo "file_name=$FILE_NAME" >> "$GITHUB_OUTPUT"
           echo "scan_type=$SCAN_TYPE" >> "$GITHUB_OUTPUT"
-          echo "Upload successful — hash: $HASH"
 
-      # ── Trigger scan ──────────────────────────────────────────────────────
       - name: Trigger static analysis
         run: |
-          echo "Starting analysis for hash: ${{ steps.upload.outputs.hash }}"
           curl -sf \
             -H "Authorization: $MOBSF_API_KEY" \
             -F "scan_type=${{ steps.upload.outputs.scan_type }}" \
@@ -259,42 +219,32 @@ jobs:
             "$MOBSF_URL/api/v1/scan" \
             -o scan-result.json
 
-          cat scan-result.json
-
-      # ── Poll for completion (instead of blind sleep) ──────────────────────
-      # MobSF's /api/v1/report_json returns an empty or error result until
-      # analysis is done, so we poll it until the expected keys appear.
       - name: Wait for analysis to complete
         run: |
           HASH="${{ steps.upload.outputs.hash }}"
-          MAX_WAIT=600   # 10 min total
+          MAX_WAIT=600  
           INTERVAL=20
           ELAPSED=0
 
-          echo "Polling for analysis completion…"
           while true; do
             STATUS=$(curl -sf \
               -H "Authorization: $MOBSF_API_KEY" \
               -d "hash=$HASH" \
               "$MOBSF_URL/api/v1/report_json" 2>/dev/null || echo '{}')
 
-            # Report is ready when it contains an "average_cvss" or "security_score" key
             if echo "$STATUS" | jq -e '.average_cvss // .security_score' >/dev/null 2>&1; then
-              echo "Analysis complete ✓ (elapsed: ${ELAPSED}s)"
+              echo "Analysis complete ✓"
               break
             fi
 
             if [ $ELAPSED -ge $MAX_WAIT ]; then
-              echo "::error::Analysis did not complete within ${MAX_WAIT}s"
+              echo "::error::Analysis timeout"
               exit 1
             fi
-
-            echo "  Still analysing… (${ELAPSED}s elapsed)"
             sleep $INTERVAL
             ELAPSED=$((ELAPSED + INTERVAL))
           done
 
-      # ── Download reports ──────────────────────────────────────────────────
       - name: Download JSON report
         run: |
           curl -sf \
@@ -303,21 +253,14 @@ jobs:
             "$MOBSF_URL/api/v1/report_json" \
             -o mobsf-report.json
 
-          echo "Report size: $(du -sh mobsf-report.json | cut -f1)"
-
       - name: Download PDF report
         run: |
-          # PDF endpoint expects form-data POST with hash
           curl -sf \
             -H "Authorization: $MOBSF_API_KEY" \
             -d "hash=${{ steps.upload.outputs.hash }}" \
             "$MOBSF_URL/api/v1/download_pdf" \
             -o mobsf-report.pdf
 
-          echo "PDF size: $(du -sh mobsf-report.pdf | cut -f1)"
-
-      # ── Security gate ─────────────────────────────────────────────────────
-      # Fails the job if the score is below the threshold (configurable above)
       - name: Evaluate security score
         id: score-gate
         run: |
@@ -331,12 +274,9 @@ jobs:
             if (( $(echo "$SCORE < $THRESHOLD" | bc -l) )); then
               echo "::error::Security score $SCORE is below threshold $THRESHOLD — failing pipeline"
               exit 1
-            else
-              echo "Security score $SCORE meets threshold $THRESHOLD ✓"
             fi
           fi
 
-      # ── Summary comment in workflow run ──────────────────────────────────
       - name: Write job summary
         if: always()
         run: |
@@ -367,23 +307,18 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── Upload artifacts (named per APK) ──────────────────────────────────
+      # FIX: Gracefully ignoring missing files if the container setup crashed early
       - name: Upload reports artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          # Each APK gets its own named artifact so they don't collide
           name: "mobsf-report-${{ steps.meta.outputs.safe_name }}-${{ github.run_number }}"
           path: |
             mobsf-report.json
             mobsf-report.pdf
             scan-result.json
           retention-days: 30
-
-      # ── Debug / cleanup ────────────────────────────────────────────────────
-      - name: Show MobSF container logs
-        if: always()
-        run: docker logs mobsf --tail 100
+          if-no-files-found: ignore
 
       - name: Stop and remove MobSF container
         if: always()

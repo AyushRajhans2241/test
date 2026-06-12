@@ -1,25 +1,35 @@
 name: MobSF APK Security Scan
-
 on:
   push:
     branches:
       - main
+    paths:
+      - '**.apk'
   workflow_dispatch:
 
 jobs:
   mobsf-scan:
     runs-on: ubuntu-latest
-
     env:
       MOBSF_URL: http://localhost:8000
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Find Latest APK
         run: |
-          APK_FILE=$(find . -type f -name "*.apk" -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+          # Find the most recently committed APK via git log
+          APK_FILE=$(git log --diff-filter=A --name-only --format="" HEAD \
+            | grep -E '\.apk$' | head -1)
+
+          # Fallback: any tracked APK sorted by most recent commit timestamp
+          if [ -z "$APK_FILE" ]; then
+            APK_FILE=$(git ls-files '*.apk' | while read f; do
+              echo "$(git log -1 --format="%ct" -- "$f") $f"
+            done | sort -rn | head -1 | cut -d' ' -f2-)
+          fi
 
           if [ -z "$APK_FILE" ]; then
             echo "No APK found in repository"
@@ -53,19 +63,16 @@ jobs:
               sleep 10
             done
           '
-
           sleep 60
 
       - name: Discover MobSF API Key
         run: |
           API_KEY=$(docker logs mobsf 2>&1 | grep -oE '[A-Fa-f0-9]{32,64}' | head -1)
-
           if [ -z "$API_KEY" ]; then
             echo "Unable to discover API key"
             docker logs mobsf --tail 200
             exit 1
           fi
-
           echo "MOBSF_API_KEY=$API_KEY" >> $GITHUB_ENV
 
       - name: Verify API Access
@@ -77,22 +84,17 @@ jobs:
       - name: Upload APK
         run: |
           echo "Uploading $APK_FILE"
-
           RESPONSE=$(curl -s \
             -H "Authorization: $MOBSF_API_KEY" \
             -F "file=@$APK_FILE" \
             "$MOBSF_URL/api/v1/upload")
-
           echo "$RESPONSE"
-
           HASH=$(echo "$RESPONSE" | jq -r '.hash')
           FILE_NAME=$(echo "$RESPONSE" | jq -r '.file_name')
-
           if [ -z "$HASH" ] || [ "$HASH" = "null" ]; then
             echo "APK upload failed"
             exit 1
           fi
-
           echo "HASH=$HASH" >> $GITHUB_ENV
           echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
 
@@ -105,7 +107,6 @@ jobs:
             -F "hash=$HASH" \
             "$MOBSF_URL/api/v1/scan" \
             -o scan-result.json
-
           cat scan-result.json
 
       - name: Wait for Analysis Completion
